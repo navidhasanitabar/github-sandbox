@@ -12,7 +12,7 @@ jobs:
   debug:
     runs-on: ubuntu-latest
 
-    timeout-minutes: 360
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -43,6 +43,7 @@ jobs:
           ./scripts/net-debug.sh "$URL"
 
       - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: net-debug-logs
