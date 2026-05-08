@@ -1,0 +1,49 @@
+name: Net Debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Target URL"
+        required: true
+        type: string
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            dnsutils \
+            curl \
+            wget \
+            aria2 \
+            openssl \
+            traceroute \
+            mtr \
+            netcat-openbsd \
+            iproute2 \
+            jq \
+            whois
+
+      - name: Run diagnostics
+        env:
+          URL: ${{ github.event.inputs.url }}
+        run: |
+          chmod +x scripts/net-debug.sh
+          ./scripts/net-debug.sh "$URL"
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: net-debug-logs
+          path: logs/
