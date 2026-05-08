@@ -28,7 +28,12 @@ echo "Host: $HOST"
 
 echo
 echo "Public IP:"
-curl -s --max-time 10 ifconfig.me
+PUBLIC_IP=$(curl -s --max-time 10 ifconfig.me)
+echo "$PUBLIC_IP"
+
+echo
+echo "Geo:"
+curl -s --max-time 10 ipinfo.io
 echo
 
 echo
@@ -39,12 +44,25 @@ echo
 echo "Routes:"
 ip route
 
+if [ -n "$FORCED_IP" ]; then
+  echo
+  echo "================================================="
+  echo "FORCED HOST ENTRY"
+  echo "================================================="
+
+  echo "$FORCED_IP $HOST" | sudo tee -a /etc/hosts
+
+  echo
+  echo "/etc/hosts:"
+  tail -10 /etc/hosts
+fi
+
 echo
 echo "================================================="
 echo "SOURCE ASN"
 echo "================================================="
 
-timeout 15 whois "$(curl -s --max-time 10 ifconfig.me)" | head -40
+timeout 20 whois "$PUBLIC_IP" | head -40
 
 echo
 echo "================================================="
@@ -56,7 +74,7 @@ TARGET_IP=$(getent hosts "$HOST" | awk '{print $1}' | head -1)
 echo "Resolved IP: $TARGET_IP"
 
 if [ -n "$TARGET_IP" ]; then
-  timeout 15 whois "$TARGET_IP" | head -60
+  timeout 20 whois "$TARGET_IP" | head -60
 fi
 
 echo
@@ -90,6 +108,21 @@ timeout 10 dig @"9.9.9.9" "$HOST"
 
 echo
 echo "================================================="
+echo "RAW TCP TESTS"
+echo "================================================="
+
+echo
+echo "Bash TCP 443:"
+timeout 10 bash -c "</dev/tcp/$HOST/443"
+echo "Exit code: $?"
+
+echo
+echo "Bash TCP 80:"
+timeout 10 bash -c "</dev/tcp/$HOST/80"
+echo "Exit code: $?"
+
+echo
+echo "================================================="
 echo "TCP TESTS"
 echo "================================================="
 
@@ -98,31 +131,41 @@ TCP80_OK=0
 
 echo
 echo "Port 443:"
-timeout 15 nc -vz "$HOST" 443
-if [ $? -eq 0 ]; then
+timeout 15 bash -c "nc -vz $HOST 443"
+RET443=$?
+
+if [ "$RET443" -eq 0 ]; then
+  echo "TCP 443 OK"
   TCP443_OK=1
+else
+  echo "TCP 443 FAILED (exit=$RET443)"
 fi
 
 echo
 echo "Port 80:"
-timeout 15 nc -vz "$HOST" 80
-if [ $? -eq 0 ]; then
+timeout 15 bash -c "nc -vz $HOST 80"
+RET80=$?
+
+if [ "$RET80" -eq 0 ]; then
+  echo "TCP 80 OK"
   TCP80_OK=1
+else
+  echo "TCP 80 FAILED (exit=$RET80)"
 fi
 
 echo
 echo "================================================="
-echo "TRACEROUTE TCP 443"
+echo "TRACEPATH"
 echo "================================================="
 
-timeout 60 traceroute -T -p 443 "$HOST"
+timeout 60 tracepath "$HOST"
 
 echo
 echo "================================================="
-echo "MTR"
+echo "MTR TCP/443"
 echo "================================================="
 
-timeout 60 mtr -rwzc 10 "$HOST"
+timeout 60 mtr --tcp --port 443 -rwzc 10 "$HOST"
 
 if [ "$TCP443_OK" -ne 1 ] && [ "$TCP80_OK" -ne 1 ]; then
   echo

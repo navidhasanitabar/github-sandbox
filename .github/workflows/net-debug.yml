@@ -8,6 +8,11 @@ on:
         required: true
         type: string
 
+      forced_ip:
+        description: "Optional forced IP for /etc/hosts"
+        required: false
+        type: string
+
 jobs:
   debug:
     runs-on: ubuntu-latest
@@ -32,12 +37,14 @@ jobs:
             mtr \
             netcat-openbsd \
             iproute2 \
+            iputils-tracepath \
             jq \
             whois
 
       - name: Run diagnostics
         env:
           URL: ${{ github.event.inputs.url }}
+          FORCED_IP: ${{ github.event.inputs.forced_ip }}
         run: |
           chmod +x scripts/net-debug.sh
           ./scripts/net-debug.sh "$URL"
