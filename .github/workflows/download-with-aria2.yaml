@@ -1,157 +1,46 @@
-name: Download from Commit & Save to Repo
+name: URL Downloader Pipeline
 
 on:
-  push:
-    branches:
-      - "**"
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Space or newline separated URLs"
+        required: true
+        type: string
 
 jobs:
-  save-file:
+  download:
     runs-on: ubuntu-latest
+
+    timeout-minutes: 60
+
     permissions:
       contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install dependencies
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 zip coreutils
+          sudo apt-get install -y aria2 curl jq coreutils
 
-      - name: Extract URLs and download files
+      - name: Run downloader
+        env:
+          URLS: ${{ github.event.inputs.urls }}
         run: |
-          set -e
+          chmod +x scripts/downloader.sh
+          ./scripts/downloader.sh "$URLS"
 
-          MSG=$(git log -1 --pretty=%B)
-          echo "Commit message: $MSG"
-
-          if echo "$MSG" | grep -qP 'download-zip:'; then
-            MODE="zip"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download-zip:\s*\K.*')
-          elif echo "$MSG" | grep -qP 'download:'; then
-            MODE="normal"
-            URL_LINE=$(echo "$MSG" | grep -oP 'download:\s*\K.*')
-          else
-            echo "❌ No download command found"
-            exit 0
-          fi
-
-          echo "Mode: $MODE"
-
-          mkdir -p downloads tmp_downloads
-
-          # Clean temp dir (important for retries)
-          rm -rf tmp_downloads/*
-          mkdir -p tmp_downloads
-
-          for URL in $URL_LINE; do
-            RAW_NAME=$(basename "$URL" | cut -d'?' -f1)
-
-            # fallback if URL ends with /
-            if [ -z "$RAW_NAME" ] || [ "$RAW_NAME" = "/" ]; then
-              RAW_NAME="file_$(date +%s)"
-            fi
-
-            # sanitize filename
-            SAFE_NAME=$(echo "$RAW_NAME" | tr -cd '[:alnum:]._-')
-
-            # avoid collisions (append short hash)
-            HASH=$(echo -n "$URL" | sha1sum | cut -c1-6)
-            FILENAME="${SAFE_NAME}_${HASH}"
-
-            echo "⬇️ $URL -> $FILENAME"
-
-            aria2c \
-              --split=2 \
-              --max-connection-per-server=2 \
-              --min-split-size=50M \
-              --dir="tmp_downloads" \
-              --out="$FILENAME" \
-              "$URL"
-          done
-
-          # Optional: bundle all into one archive first
-          if [ "$MODE" = "zip" ]; then
-            BUNDLE="tmp_downloads/bundle_$(date +%s).zip"
-            zip -r "$BUNDLE" tmp_downloads/*
-            rm -rf tmp_downloads/*
-            mv "$BUNDLE" tmp_downloads/
-          fi
-
-          LIMIT=$((90 * 1024 * 1024))
-
-          for FILE in tmp_downloads/*; do
-            [ -f "$FILE" ] || continue
-
-            SIZE=$(stat -c%s "$FILE")
-            BASENAME=$(basename "$FILE")
-            DEST_PREFIX="downloads/${BASENAME}"
-
-            if [ "$SIZE" -gt "$LIMIT" ]; then
-              echo "✂️ Splitting $BASENAME ($(($SIZE / 1024 / 1024)) MB)"
-
-              # Clean any previous leftovers
-              rm -f "${DEST_PREFIX}.zip" "${DEST_PREFIX}.z"* "${DEST_PREFIX}.part_"*
-
-              # Use split instead of zip -s (more reliable)
-              split -b 90M -d "$FILE" "${DEST_PREFIX}.part_"
-
-              echo "✅ Created parts:"
-              ls "${DEST_PREFIX}.part_"*
-            else
-              # Handle collision in downloads/
-              FINAL="$DEST_PREFIX"
-
-              if [ -f "$FINAL" ]; then
-                TS=$(date +%s)
-                FINAL="${DEST_PREFIX}_${TS}"
-              fi
-
-              cp "$FILE" "$FINAL"
-            fi
-          done
-
-          rm -rf tmp_downloads
-
-      - name: Commit & Push in batches of 5 files
+      - name: Commit results
         run: |
-          set -e
-
-          BRANCH="${GITHUB_REF_NAME}"
-
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          mapfile -t FILES < <(git ls-files --others --modified --exclude-standard downloads/)
+          git add downloads/
 
-          TOTAL=${#FILES[@]}
-          echo "📦 Total files: $TOTAL"
+          git diff --cached --quiet && echo "No changes" && exit 0
 
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "Nothing to commit"
-            exit 0
-          fi
-
-          BATCH_SIZE=5
-          BATCH_NUM=0
-
-          for ((i=0; i<TOTAL; i+=BATCH_SIZE)); do
-            BATCH_NUM=$((BATCH_NUM+1))
-            BATCH=("${FILES[@]:i:BATCH_SIZE}")
-
-            echo "🚀 Batch $BATCH_NUM"
-
-            git add "${BATCH[@]}"
-            git commit -m "Add downloaded files — batch $BATCH_NUM [skip ci]" || true
-
-            git pull --rebase origin "$BRANCH"
-            git push origin HEAD:"$BRANCH"
-
-            echo "✅ Batch $BATCH_NUM pushed"
-          done
-
-          echo "🎉 Done"
+          git commit -m "Add downloaded files [ci skip]"
+          git push
