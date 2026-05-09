@@ -64,12 +64,12 @@ jobs:
           echo "max=$MAX" >> $GITHUB_OUTPUT
           echo "file=$JOB_FILE" >> $GITHUB_OUTPUT
 
-      - name: Download file
+      - name: Download file (chunked safe)
         if: steps.job.outputs.no_job == 'false'
         run: |
           set -e
 
-          mkdir -p downloads
+          mkdir -p downloads/tmp downloads/chunks
 
           URL="${{ steps.load.outputs.url }}"
 
@@ -78,33 +78,58 @@ jobs:
             FILENAME="file_$(date +%s)"
           fi
 
-          HASH=$(echo -n "$URL" | sha1sum | cut -c1-6)
-          SAFE_NAME="${FILENAME}_${HASH}"
+          BASE="${FILENAME%.*}"
+          EXT="${FILENAME##*.}"
+
+          HASH=$(echo -n "$URL" | sha1sum | cut -c1-8)
+          TS=$(date +%s)
+
+          SAFE_PREFIX="${BASE}_${HASH}_${TS}"
+
+          TMP_FILE="downloads/tmp/${SAFE_PREFIX}.${EXT}"
 
           echo "Downloading: $URL"
+
           aria2c \
             --split=4 \
             --max-connection-per-server=4 \
-            --dir=downloads \
-            --out="$SAFE_NAME" \
+            --dir=downloads/tmp \
+            --out="${SAFE_PREFIX}.${EXT}" \
             "$URL"
+
+          # ----------------------------
+          # SPLIT INTO 90MB CHUNKS
+          # ----------------------------
+          CHUNK_DIR="downloads/chunks/${SAFE_PREFIX}"
+          mkdir -p "$CHUNK_DIR"
+
+          echo "Splitting into 90MB chunks..."
+
+          split -b 90M -d -a 4 \
+            "$TMP_FILE" \
+            "${CHUNK_DIR}/part_"
+
+          rm -f "$TMP_FILE"
+
+          echo "Done:"
+          ls -lh "$CHUNK_DIR"
 
       - name: Move job to done
         if: success() && steps.job.outputs.no_job == 'false'
         run: |
           mv queue/processing/*.json queue/done/
 
-      - name: Commit results (INCLUDING downloads)
+      - name: Commit results (chunked downloads)
         run: |
           set -e
 
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          # IMPORTANT: include downloads now
-          git add queue/ downloads/
+          # ONLY commit safe data (NO raw large files)
+          git add queue/ downloads/chunks/ || true
 
-          git commit -m "worker: processed job + downloaded file" || true
+          git commit -m "worker: processed job + chunked download" || true
 
           git pull --rebase origin main
           git push origin HEAD:main
