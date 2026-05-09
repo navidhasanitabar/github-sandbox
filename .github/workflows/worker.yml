@@ -1,63 +1,57 @@
-name: Download Queue Worker
+name: Download from Commit & Save to Repo
 
 on:
   push:
     branches:
       - "**"
-  workflow_dispatch:
 
 jobs:
   worker:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y aria2 jq coreutils zip
 
-      # -----------------------------
-      # 1. Pick a job from queue
-      # -----------------------------
-      - name: Fetch job
-        id: fetch
+      - name: Setup directories
+        run: |
+          mkdir -p queue/pending queue/processing queue/done queue/failed downloads
+
+      - name: Pick job
+        id: job
         run: |
           set -e
 
           JOB=$(ls queue/pending/*.json 2>/dev/null | head -n 1 || true)
 
           if [ -z "$JOB" ]; then
-            echo "NO_JOB=true" >> $GITHUB_OUTPUT
+            echo "no_job=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "NO_JOB=false" >> $GITHUB_OUTPUT
-          echo "JOB_FILE=$JOB" >> $GITHUB_OUTPUT
+          echo "no_job=false" >> $GITHUB_OUTPUT
+          echo "job=$JOB" >> $GITHUB_OUTPUT
 
-      # -----------------------------
-      # 2. Move to processing
-      # -----------------------------
-      - name: Lock job
-        if: steps.fetch.outputs.NO_JOB == 'false'
+      - name: Move job to processing
+        if: steps.job.outputs.no_job == 'false'
         run: |
-          mv "${{ steps.fetch.outputs.JOB_FILE }}" queue/processing/
+          mv "${{ steps.job.outputs.job }}" queue/processing/
 
-      # -----------------------------
-      # 3. Load job data
-      # -----------------------------
-      - name: Parse job
-        if: steps.fetch.outputs.NO_JOB == 'false'
-        id: job
+      - name: Load job
+        if: steps.job.outputs.no_job == 'false'
+        id: load
         run: |
-          set -e
-
-          JOB_FILE="queue/processing/$(basename ${{ steps.fetch.outputs.JOB_FILE }})"
+          JOB_FILE="queue/processing/$(basename "${{ steps.job.outputs.job }}")"
 
           URL=$(jq -r '.url' "$JOB_FILE")
           ID=$(jq -r '.id' "$JOB_FILE")
@@ -66,56 +60,51 @@ jobs:
 
           echo "url=$URL" >> $GITHUB_OUTPUT
           echo "id=$ID" >> $GITHUB_OUTPUT
+          echo "retries=$RETRIES" >> $GITHUB_OUTPUT
+          echo "max=$MAX" >> $GITHUB_OUTPUT
           echo "file=$JOB_FILE" >> $GITHUB_OUTPUT
 
-      # -----------------------------
-      # 4. Download
-      # -----------------------------
       - name: Download file
-        if: steps.fetch.outputs.NO_JOB == 'false'
+        if: steps.job.outputs.no_job == 'false'
         run: |
           set -e
 
           mkdir -p downloads
 
+          URL="${{ steps.load.outputs.url }}"
+
+          FILENAME=$(basename "$URL" | cut -d'?' -f1)
+          if [ -z "$FILENAME" ]; then
+            FILENAME="file_$(date +%s)"
+          fi
+
+          HASH=$(echo -n "$URL" | sha1sum | cut -c1-6)
+          SAFE_NAME="${FILENAME}_${HASH}"
+
+          echo "Downloading: $URL"
           aria2c \
-            --continue=true \
-            --max-connection-per-server=4 \
             --split=4 \
-            --timeout=30 \
-            --retry-wait=5 \
-            --max-tries=3 \
+            --max-connection-per-server=4 \
             --dir=downloads \
-            "${{ steps.job.outputs.url }}"
+            --out="$SAFE_NAME" \
+            "$URL"
 
-      # -----------------------------
-      # 5. Upload as GitHub Artifact
-      # -----------------------------
-      - name: Upload artifact
-        if: steps.fetch.outputs.NO_JOB == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: download-${{ steps.job.outputs.id }}
-          path: downloads/
-
-      # -----------------------------
-      # 6. Mark job as done
-      # -----------------------------
-      - name: Finish job
-        if: steps.fetch.outputs.NO_JOB == 'false'
+      - name: Move job to done
+        if: success() && steps.job.outputs.no_job == 'false'
         run: |
-          mv queue/processing/* queue/done/
+          mv queue/processing/*.json queue/done/
 
-      # -----------------------------
-      # 7. Commit queue state only
-      # -----------------------------
-      - name: Commit queue state
-        if: steps.fetch.outputs.NO_JOB == 'false'
+      - name: Commit results (INCLUDING downloads)
         run: |
+          set -e
+
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git add queue/
+          # IMPORTANT: include downloads now
+          git add queue/ downloads/
 
-          git commit -m "queue update [skip ci]" || true
-          git push
+          git commit -m "worker: processed job + downloaded file" || true
+
+          git pull --rebase origin main
+          git push origin HEAD:main
