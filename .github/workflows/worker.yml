@@ -1,0 +1,128 @@
+name: Queue Worker Downloader
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "queue/**"
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+concurrency:
+  group: downloader-worker
+  cancel-in-progress: false
+
+jobs:
+  worker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 jq coreutils
+
+      - name: Pick job
+        id: pick
+        run: |
+          set -e
+
+          JOB=$(ls queue/pending/*.json 2>/dev/null | head -n 1 || true)
+
+          if [ -z "$JOB" ]; then
+            echo "NO_JOB=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "JOB=$JOB" >> $GITHUB_OUTPUT
+          echo "NO_JOB=false" >> $GITHUB_OUTPUT
+
+      - name: Move to processing
+        if: steps.pick.outputs.NO_JOB == 'false'
+        run: |
+          mv "${{ steps.pick.outputs.JOB }}" queue/processing/
+
+      - name: Load job
+        if: steps.pick.outputs.NO_JOB == 'false'
+        id: job
+        run: |
+          JOB_FILE="queue/processing/$(basename ${{ steps.pick.outputs.JOB }})"
+
+          URL=$(jq -r '.url' "$JOB_FILE")
+          ID=$(jq -r '.id' "$JOB_FILE")
+          RETRIES=$(jq -r '.retries' "$JOB_FILE")
+          MAX=$(jq -r '.max_retries' "$JOB_FILE")
+
+          echo "url=$URL" >> $GITHUB_OUTPUT
+          echo "id=$ID" >> $GITHUB_OUTPUT
+          echo "retries=$RETRIES" >> $GITHUB_OUTPUT
+          echo "max=$MAX" >> $GITHUB_OUTPUT
+          echo "file=$JOB_FILE" >> $GITHUB_OUTPUT
+
+      - name: Debug DNS (optional but useful)
+        if: steps.pick.outputs.NO_JOB == 'false'
+        run: |
+          HOST=$(echo "${{ steps.job.outputs.url }}" | awk -F/ '{print $3}')
+          echo "HOST=$HOST"
+          dig +short "$HOST" || true
+
+      - name: Download file
+        if: steps.pick.outputs.NO_JOB == 'false'
+        run: |
+          set +e
+
+          mkdir -p downloads
+
+          aria2c \
+            --continue=true \
+            --max-connection-per-server=4 \
+            --split=4 \
+            --timeout=30 \
+            --retry-wait=5 \
+            --max-tries=3 \
+            --dir=downloads \
+            "${{ steps.job.outputs.url }}"
+
+          echo "EXIT_CODE=$?" >> $GITHUB_ENV
+
+      - name: Success path
+        if: env.EXIT_CODE == '0'
+        run: |
+          mv "${{ steps.job.outputs.file }}" queue/done/
+
+      - name: Failure + retry logic
+        if: env.EXIT_CODE != '0'
+        run: |
+          set -e
+
+          FILE="${{ steps.job.outputs.file }}"
+
+          RETRIES=$(jq -r '.retries' "$FILE")
+          MAX=$(jq -r '.max_retries' "$FILE")
+
+          RETRIES=$((RETRIES + 1))
+
+          jq ".retries=$RETRIES" "$FILE" > tmp.json && mv tmp.json "$FILE"
+
+          if [ "$RETRIES" -ge "$MAX" ]; then
+            mv "$FILE" queue/failed/
+          else
+            mv "$FILE" queue/pending/
+          fi
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add queue/
+
+          git commit -m "queue update" || true
+          git push
