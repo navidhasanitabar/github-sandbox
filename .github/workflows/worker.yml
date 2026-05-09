@@ -1,35 +1,32 @@
-name: Queue Worker Downloader
+name: Download Queue Worker
 
 on:
   push:
-    branches: ["**"]
-    paths:
-      - "queue/**"
+    branches:
+      - "**"
   workflow_dispatch:
-  schedule:
-    - cron: "*/10 * * * *"
-
-concurrency:
-  group: downloader-worker
-  cancel-in-progress: false
 
 jobs:
   worker:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 jq coreutils
+          sudo apt-get install -y aria2 jq coreutils zip
 
-      - name: Pick job
-        id: pick
+      # -----------------------------
+      # 1. Pick a job from queue
+      # -----------------------------
+      - name: Fetch job
+        id: fetch
         run: |
           set -e
 
@@ -40,19 +37,27 @@ jobs:
             exit 0
           fi
 
-          echo "JOB=$JOB" >> $GITHUB_OUTPUT
           echo "NO_JOB=false" >> $GITHUB_OUTPUT
+          echo "JOB_FILE=$JOB" >> $GITHUB_OUTPUT
 
-      - name: Move to processing
-        if: steps.pick.outputs.NO_JOB == 'false'
+      # -----------------------------
+      # 2. Move to processing
+      # -----------------------------
+      - name: Lock job
+        if: steps.fetch.outputs.NO_JOB == 'false'
         run: |
-          mv "${{ steps.pick.outputs.JOB }}" queue/processing/
+          mv "${{ steps.fetch.outputs.JOB_FILE }}" queue/processing/
 
-      - name: Load job
-        if: steps.pick.outputs.NO_JOB == 'false'
+      # -----------------------------
+      # 3. Load job data
+      # -----------------------------
+      - name: Parse job
+        if: steps.fetch.outputs.NO_JOB == 'false'
         id: job
         run: |
-          JOB_FILE="queue/processing/$(basename ${{ steps.pick.outputs.JOB }})"
+          set -e
+
+          JOB_FILE="queue/processing/$(basename ${{ steps.fetch.outputs.JOB_FILE }})"
 
           URL=$(jq -r '.url' "$JOB_FILE")
           ID=$(jq -r '.id' "$JOB_FILE")
@@ -61,21 +66,15 @@ jobs:
 
           echo "url=$URL" >> $GITHUB_OUTPUT
           echo "id=$ID" >> $GITHUB_OUTPUT
-          echo "retries=$RETRIES" >> $GITHUB_OUTPUT
-          echo "max=$MAX" >> $GITHUB_OUTPUT
           echo "file=$JOB_FILE" >> $GITHUB_OUTPUT
 
-      - name: Debug DNS (optional but useful)
-        if: steps.pick.outputs.NO_JOB == 'false'
-        run: |
-          HOST=$(echo "${{ steps.job.outputs.url }}" | awk -F/ '{print $3}')
-          echo "HOST=$HOST"
-          dig +short "$HOST" || true
-
+      # -----------------------------
+      # 4. Download
+      # -----------------------------
       - name: Download file
-        if: steps.pick.outputs.NO_JOB == 'false'
+        if: steps.fetch.outputs.NO_JOB == 'false'
         run: |
-          set +e
+          set -e
 
           mkdir -p downloads
 
@@ -89,40 +88,34 @@ jobs:
             --dir=downloads \
             "${{ steps.job.outputs.url }}"
 
-          echo "EXIT_CODE=$?" >> $GITHUB_ENV
+      # -----------------------------
+      # 5. Upload as GitHub Artifact
+      # -----------------------------
+      - name: Upload artifact
+        if: steps.fetch.outputs.NO_JOB == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: download-${{ steps.job.outputs.id }}
+          path: downloads/
 
-      - name: Success path
-        if: env.EXIT_CODE == '0'
+      # -----------------------------
+      # 6. Mark job as done
+      # -----------------------------
+      - name: Finish job
+        if: steps.fetch.outputs.NO_JOB == 'false'
         run: |
-          mv "${{ steps.job.outputs.file }}" queue/done/
+          mv queue/processing/* queue/done/
 
-      - name: Failure + retry logic
-        if: env.EXIT_CODE != '0'
-        run: |
-          set -e
-
-          FILE="${{ steps.job.outputs.file }}"
-
-          RETRIES=$(jq -r '.retries' "$FILE")
-          MAX=$(jq -r '.max_retries' "$FILE")
-
-          RETRIES=$((RETRIES + 1))
-
-          jq ".retries=$RETRIES" "$FILE" > tmp.json && mv tmp.json "$FILE"
-
-          if [ "$RETRIES" -ge "$MAX" ]; then
-            mv "$FILE" queue/failed/
-          else
-            mv "$FILE" queue/pending/
-          fi
-
-      - name: Commit results
-        if: always()
+      # -----------------------------
+      # 7. Commit queue state only
+      # -----------------------------
+      - name: Commit queue state
+        if: steps.fetch.outputs.NO_JOB == 'false'
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
           git add queue/
 
-          git commit -m "queue update" || true
+          git commit -m "queue update [skip ci]" || true
           git push
